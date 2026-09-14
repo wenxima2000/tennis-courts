@@ -22,6 +22,8 @@ let cfg = {};
 try { cfg = JSON.parse(fs.readFileSync(new URL('./config.json', import.meta.url), 'utf8')); } catch {}
 const FAMILY_NAME = process.env.INTRAC_FAMILY_NAME || cfg.familyName;
 const EMAIL = process.env.INTRAC_EMAIL || cfg.email;
+const SUSF_EMAIL = process.env.SUSF_EMAIL || cfg.susfEmail;
+const SUSF_PASSWORD = process.env.SUSF_PASSWORD || cfg.susfPassword;
 
 const SITES = {
   parklands: {
@@ -35,7 +37,70 @@ const SITES = {
     url: 'https://jensenstennis.intrac.com.au/dashboard?page=space&location_id=',
     locationFilter: (name) => !/table tennis/i.test(name),
   },
+  susf: {
+    name: 'Sydney Uni Sport (SUSF)',
+    engine: 'perfectmind',
+    base: 'https://susf.perfectmind.com/39161/Clients',
+    widgetId: 'c5b8cc8a-09fe-48ae-a693-df5c09f81adb',
+    calendarId: '7cb1945d-e899-4e40-96c4-8ee784ccfc2d',
+    courts: {
+      'Tennis Hard Court 1': '0867c749-799a-4179-b5e7-6e167366c02c',
+      'Tennis Hard Court 2': '2e554328-7850-44c3-95ee-281593d4cbe7',
+      'Tennis Hard Court 3': '25b51a37-76e7-4da0-8b0b-257dd1171745',
+      'Tennis Synthetic Court 4': '2d1184fd-610d-40fd-b96a-8890efb8e074',
+      'Tennis Synthetic Court 5': 'eeecf276-bce4-4337-b825-75a32727d089',
+      'Tennis Synthetic Court 6': '3b5c69f8-1665-439d-befe-29fabad8c044',
+    },
+  },
 };
+
+// ---------- SUSF (PerfectMind) ----------
+async function susfLogin(page, site) {
+  // Open the facility list first so we can detect the login state from the header.
+  await page.goto(`${site.base}/BookMe4FacilityList/List?calendarId=${site.calendarId}&widgetId=${site.widgetId}&embed=False`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(4000);
+  const loggedOut = await page.locator('a.pm-login-button:visible').count();
+  if (!loggedOut) return;
+  if (!SUSF_EMAIL || !SUSF_PASSWORD) {
+    console.log('[susf] 未配置账号，匿名查询（可订时段可能不全）。');
+    return;
+  }
+  await page.goto('https://susf.perfectmind.com/39161/MemberRegistration/MemberSignIn', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForSelector('#textBoxUsername', { timeout: 30000 });
+  await page.fill('#textBoxUsername', SUSF_EMAIL);
+  await page.fill('#textBoxPassword', SUSF_PASSWORD);
+  await page.click('#btnLogin');
+  await page.waitForTimeout(6000);
+  const stillOut = await page.locator('#textBoxUsername').count();
+  if (stillOut) console.log('[susf] 登录似乎失败，将以匿名方式继续（可订时段可能不全）。');
+  else console.log('[susf] logged in.');
+}
+
+function parseSlotTitle(title) {
+  // "9:00 PM-10:00 PM" -> [startMin, endMin]
+  const m = title.match(/(\d{1,2}):(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (!m) return null;
+  const conv = (h, ap) => (parseInt(h, 10) % 12) + (/pm/i.test(ap) ? 12 : 0);
+  return [conv(m[1], m[3]) * 60 + parseInt(m[2], 10), conv(m[4], m[6]) * 60 + parseInt(m[5], 10)];
+}
+
+async function scrapeSusf(page, site, courtName, facilityId, dateIso) {
+  const url = `${site.base}/BookMe4LandingPages/Facility?facilityId=${facilityId}&widgetId=${site.widgetId}&calendarId=${site.calendarId}&arrivalDate=${dateIso}T00:00:00`;
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForSelector('.facility-booking-slot, .facility-name', { timeout: 60000 }).catch(() => {});
+  await page.waitForTimeout(3000);
+  const titles = await page.$$eval('.facility-booking-slot span[title]', els => els.map(e => e.getAttribute('title')));
+  const mins = titles.map(parseSlotTitle).filter(Boolean);
+  // merge overlapping bookable intervals into continuous coverage ranges
+  mins.sort((a, b) => a[0] - b[0]);
+  const ranges = [];
+  for (const [s, e] of mins) {
+    const last = ranges[ranges.length - 1];
+    if (last && s <= last.end) last.end = Math.max(last.end, e);
+    else ranges.push({ start: s, end: e });
+  }
+  return ranges.map(r => `${toHHMM(r.start)}-${toHHMM(r.end)}`);
+}
 
 // ---------- CLI args ----------
 function parseArgs() {
@@ -232,6 +297,20 @@ for (const key of siteKeys) {
   const site = SITES[key];
   if (!site) { console.error(`Unknown site: ${key}`); continue; }
   try {
+    if (site.engine === 'perfectmind') {
+      await susfLogin(page, site);
+      let courts = Object.entries(site.courts);
+      if (opt.location) courts = courts.filter(([n]) => n.toLowerCase().includes(opt.location.toLowerCase()));
+      for (const [courtName, facilityId] of courts) {
+        for (let d = 0; d < opt.days; d++) {
+          const date = addDays(opt.date, d);
+          const ranges = await scrapeSusf(page, site, courtName, facilityId, date);
+          console.log(`\n== ${site.name} — ${courtName} (${prettyDate(date)}) ==`);
+          console.log(`  ${ranges.length ? ranges.join(', ') + ' bookable' : 'no bookable slots'}`);
+        }
+      }
+      continue;
+    }
     await page.goto(site.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await waitForApp(page);
     await ensureLogin(page, key);
